@@ -89,66 +89,68 @@ const HEIGHT: u32 = 1080;
 const FRAME_RATE: u32 = 75;
 const BITRATE: u32 = 10_000_000;
 const TIMEOUT: u32 = 10000;
+const NUM_BUFFERS: usize = 2;
 
 fn main() {
     let monitor = Monitor::primary().unwrap();
     let mut duplication = DxgiDuplicationApi::new(monitor).unwrap();
 
-    let encoder = create_encoder(duplication.device(), WIDTH, HEIGHT, FRAME_RATE, BITRATE);
     // Create bidirectional channel as two unidirectional channels
-    let (processed, to_use) = mpsc::sync_channel::<BitStream>(2);
-    let (re_use, to_process) = mpsc::sync_channel::<BitStream>(2);
-    for _ in 0..2 {
-        processed
-            .send(encoder.create_bitstream_buffer().unwrap())
-            .unwrap();
-    }
+    let (processed, to_use) = mpsc::sync_channel::<BitStream>(NUM_BUFFERS);
+    let (re_use, to_process) = mpsc::sync_channel::<BitStream>(NUM_BUFFERS);
 
     let handle = std::thread::spawn({
         move || {
-            let mut out = File::create("output.h264").unwrap();
+            let encoder = create_encoder(duplication.device(), WIDTH, HEIGHT, FRAME_RATE, BITRATE);
+            for _ in 0..NUM_BUFFERS {
+                re_use
+                    .send(encoder.create_bitstream_buffer().unwrap())
+                    .unwrap();
+            }
+            let instant = Instant::now();
+            let mut i = 0;
+            while i < 600 {
+                if let Ok(output) = to_use.recv() {
+                    println!("Frame: {i}");
+                    let frame = duplication.acquire_next_frame(TIMEOUT).unwrap();
+                    // NOTE: should this texture be copied to another texture before giving it to the encoder?
+                    let texture = frame.texture();
+                    let registered = encoder
+                        .register_resource_dx11(&texture, NVencBufferFormat::ARGB, 0)
+                        .unwrap();
 
-            for output in to_process {
-                let lock = output.try_lock(true).unwrap();
-                out.write_all(lock.as_slice()).unwrap();
-                drop(lock);
-                if let Err(_) = processed.send(output) {
-                    break;
+                    encoder
+                        .encode_picture(
+                            &registered,
+                            &output,
+                            i,
+                            instant.elapsed().as_millis() as u64,
+                            NVencBufferFormat::ARGB,
+                            NVencPicStruct::Frame,
+                            NVencPicType::P,
+                            None,
+                        )
+                        .unwrap();
+                    re_use.send(output).unwrap();
+                    i += 1;
                 }
             }
+            println!("Average FPS: {:?}", 600.0 / instant.elapsed().as_secs_f64());
         }
     });
-    let instant = Instant::now();
-    let mut i = 0;
-    while i < 600 {
-        if let Ok(output) = to_use.recv() {
-            println!("Frame: {i}");
-            let frame = duplication.acquire_next_frame(TIMEOUT).unwrap();
-            // NOTE: should this texture be copied to another texture before giving it to the encoder?
-            let texture = frame.texture();
-            let registered = encoder
-                .register_resource_dx11(&texture, NVencBufferFormat::ARGB, 0)
-                .unwrap();
-
-            encoder
-                .encode_picture(
-                    &registered,
-                    &output,
-                    i,
-                    instant.elapsed().as_millis() as u64,
-                    NVencBufferFormat::ARGB,
-                    NVencPicStruct::Frame,
-                    NVencPicType::P,
-                    None,
-                )
-                .unwrap();
-            re_use.send(output).unwrap();
-            i += 1;
+    // First NUM_BUFFERS buffers are uninitialized.
+    for _ in 0..NUM_BUFFERS {
+        let output = to_process.recv().unwrap();
+        processed.send(output).unwrap();
+    }
+    while let Ok(output) = to_process.recv() {
+        let lock = output.try_lock(true).unwrap();
+        let data = lock.as_slice().to_vec();
+        drop(lock);
+        println!("{} bytes of data", data.len());
+        if let Err(_) = processed.send(output) {
+            break;
         }
     }
-    println!("Average FPS: {:?}", 600.0 / instant.elapsed().as_secs_f64());
-
-    drop(to_use);
-    drop(re_use);
     handle.join().unwrap();
 }
