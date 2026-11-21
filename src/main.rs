@@ -1,6 +1,7 @@
 use std::fs::File;
 use std::io::Write;
 use std::time::Instant;
+use std::sync::mpsc;
 
 use nvenc::bitstream::BitStream;
 use nvenc::session::InitParams;
@@ -11,7 +12,7 @@ use nvenc::{
         guids::{NV_ENC_CODEC_H264_GUID, NV_ENC_PRESET_P3_GUID},
     },
 };
-use nvenc::encoder::Encoder;
+use nvenc::encoder::Encoder as NvEncoder;
 use windows::Win32::{
     Graphics::{
         Direct3D11::*,
@@ -21,29 +22,6 @@ use windows::Win32::{
 use windows::core::Result;
 use windows_capture::dxgi_duplication_api::DxgiDuplicationApi;
 use windows_capture::monitor::Monitor;
-
-fn image(device: &ID3D11Device) -> Result<ID3D11Texture2D> {
-    unsafe {
-        let mut texture = None;
-        let desc = D3D11_TEXTURE2D_DESC {
-            Width: 1920,
-            Height: 1080,
-            MipLevels: 1,
-            ArraySize: 1,
-            Format: DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,
-            SampleDesc: DXGI_SAMPLE_DESC {
-                Count: 1,
-                Quality: 0,
-            },
-            Usage: D3D11_USAGE_DEFAULT,
-            BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
-            CPUAccessFlags: DXGI_CPU_ACCESS_NONE,
-            MiscFlags: 0,
-        };
-        device.CreateTexture2D(&raw const desc, None, Some(&mut texture))?;
-        Ok(texture.unwrap())
-    }
-}
 
 // Adapted from the gcd crate
 pub const fn gcd(a: u32, b: u32) -> u32 {
@@ -62,7 +40,7 @@ fn create_encoder(
     height: u32,
     frame_rate: u32,
     average_bitrate: u32,
-) -> Encoder {
+) -> NvEncoder {
     let gcd = gcd(width, height);
     let aspect_ratio = [width / gcd, height / gcd];
     let session: Session<nvenc::session::NeedsConfig> = Session::open_dx(device).unwrap();
@@ -117,20 +95,20 @@ fn main() {
     let mut duplication = DxgiDuplicationApi::new(monitor).unwrap();
 
     let encoder = create_encoder(duplication.device(), WIDTH, HEIGHT, FRAME_RATE, BITRATE);
-    let (processed, to_use) = std::sync::mpsc::sync_channel::<BitStream>(2);
-    let (re_use, to_process) = std::sync::mpsc::sync_channel::<BitStream>(2);
-    processed
-        .send(encoder.create_bitstream_buffer().unwrap())
-        .unwrap();
-    processed
-        .send(encoder.create_bitstream_buffer().unwrap())
-        .unwrap();
+    // Create bidirectional channel as two unidirectional channels
+    let (processed, to_use) = mpsc::sync_channel::<BitStream>(2);
+    let (re_use, to_process) = mpsc::sync_channel::<BitStream>(2);
+    for _ in 0..2 {
+        processed
+            .send(encoder.create_bitstream_buffer().unwrap())
+            .unwrap();
+    }
 
     let handle = std::thread::spawn({
         move || {
             let mut out = File::create("output.h264").unwrap();
 
-            while let Ok(output) = to_process.recv() {
+            for output in to_process {
                 let lock = output.try_lock(true).unwrap();
                 out.write_all(lock.as_slice()).unwrap();
                 drop(lock);
@@ -146,6 +124,7 @@ fn main() {
         if let Ok(output) = to_use.recv() {
             println!("Frame: {i}");
             let frame = duplication.acquire_next_frame(TIMEOUT).unwrap();
+            // NOTE: should this texture be copied to another texture before giving it to the encoder?
             let texture = frame.texture();
             let registered = encoder
                 .register_resource_dx11(&texture, NVencBufferFormat::ARGB, 0)
@@ -167,6 +146,7 @@ fn main() {
             i += 1;
         }
     }
+    println!("Average FPS: {:?}", 600.0 / instant.elapsed().as_secs_f64());
 
     drop(to_use);
     drop(re_use);
