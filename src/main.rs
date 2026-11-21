@@ -1,5 +1,3 @@
-use std::fs::File;
-use std::io::Write;
 use std::time::Instant;
 use std::sync::mpsc;
 
@@ -16,10 +14,8 @@ use nvenc::encoder::Encoder as NvEncoder;
 use windows::Win32::{
     Graphics::{
         Direct3D11::*,
-        Dxgi::Common::*,
     },
 };
-use windows::core::Result;
 use windows_capture::dxgi_duplication_api::DxgiDuplicationApi;
 use windows_capture::monitor::Monitor;
 
@@ -99,15 +95,16 @@ impl<T> SyncQueue<T> {
         (a, b)
     }
 
-    pub fn push(&mut self, value: T) -> std::result::Result<(), mpsc::SendError<T>> {
+    pub fn push(&mut self, value: T) -> Result<(), mpsc::SendError<T>> {
         self.sender.send(value)
     }
 
-    pub fn pop(&mut self) -> std::result::Result<T, mpsc::RecvError> {
+    pub fn pop(&mut self) -> Result<T, mpsc::RecvError> {
         self.receiver.recv()
     }
 }
 
+// TODO: resize if input resolution is different from configured resolution
 const WIDTH: u32 = 1920;
 const HEIGHT: u32 = 1080;
 const FRAME_RATE: u32 = 75;
