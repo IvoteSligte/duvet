@@ -1,7 +1,9 @@
 mod nvenc;
+mod util;
 
 use ::nvenc::session::NeedsConfig;
 use nvenc::NVEncError;
+use util::{SyncQueue, gcd};
 
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -41,17 +43,6 @@ impl From<::nvenc::sys::result::NVencError> for Error {
     fn from(value: ::nvenc::sys::result::NVencError) -> Self {
         Self::NVEnc(value.into())
     }
-}
-
-// Adapted from the gcd crate
-const fn gcd(a: u32, b: u32) -> u32 {
-    // variable names based off euclidean division equation: a = b · q + r
-    let (mut a, mut b) = if a > b { (a, b) } else { (b, a) };
-    while b != 0 {
-        std::mem::swap(&mut a, &mut b);
-        b %= a;
-    }
-    a
 }
 
 fn create_encoder(
@@ -103,42 +94,7 @@ fn create_encoder(
     Ok(session.init_encoder(init_params)?)
 }
 
-struct SyncQueue<T> {
-    timeout: Duration,
-    sender: mpsc::SyncSender<T>,
-    receiver: mpsc::Receiver<T>,
-}
-
-impl<T> SyncQueue<T> {
-    pub fn new(capacity: usize, timeout: Duration) -> (Self, Self) {
-        // Create bidirectional channel as two unidirectional channels
-        let (a_sender, b_receiver) = mpsc::sync_channel(capacity);
-        let (b_sender, a_receiver) = mpsc::sync_channel(capacity);
-        let a = Self {
-            timeout,
-            sender: a_sender,
-            receiver: a_receiver,
-        };
-        let b = Self {
-            timeout,
-            sender: b_sender,
-            receiver: b_receiver,
-        };
-        (a, b)
-    }
-
-    #[inline(always)]
-    pub fn push(&mut self, value: T) -> Result<(), mpsc::SendError<T>> {
-        self.sender.send(value)
-    }
-
-    #[inline(always)]
-    pub fn pop(&mut self) -> Result<T, mpsc::RecvTimeoutError> {
-        self.receiver.recv_timeout(self.timeout)
-    }
-}
-
-// TODO: resize if input resolution is different from configured resolution
+// TODO: downscale and drop frames if input resolution/FPS is different from configured resolution/FPS
 
 // More than one buffer is theoretically more performant, but I have not observed any performance issues
 // and it seems to randomly deadlock with more than one buffer.
@@ -208,6 +164,8 @@ fn spawn_encoder_thread(
     })
 }
 
+/// The returned H.264 video stream has a resolution of at most `resolution` pixels
+/// and a frame-rate of at most `frame_rate` FPS.
 pub fn capture(resolution: (u32, u32), frame_rate: u32, bitrate: u32) -> Result<(), Error> {
     let monitor = Monitor::primary()?;
     let duplication = DxgiDuplicationApi::new(monitor)?;
