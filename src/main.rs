@@ -1,7 +1,8 @@
-use std::time::{Instant, Duration};
 use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
 use nvenc::bitstream::BitStream;
+use nvenc::encoder::Encoder as NvEncoder;
 use nvenc::session::InitParams;
 use nvenc::{
     session::Session,
@@ -10,12 +11,7 @@ use nvenc::{
         guids::{NV_ENC_CODEC_H264_GUID, NV_ENC_PRESET_P3_GUID},
     },
 };
-use nvenc::encoder::Encoder as NvEncoder;
-use windows::Win32::{
-    Graphics::{
-        Direct3D11::*,
-    },
-};
+use windows::Win32::Graphics::Direct3D11::*;
 use windows_capture::dxgi_duplication_api::DxgiDuplicationApi;
 use windows_capture::monitor::Monitor;
 
@@ -91,8 +87,16 @@ impl<T> SyncQueue<T> {
         // Create bidirectional channel as two unidirectional channels
         let (a_sender, b_receiver) = mpsc::sync_channel(capacity);
         let (b_sender, a_receiver) = mpsc::sync_channel(capacity);
-        let a = Self { timeout, sender: a_sender, receiver: a_receiver };
-        let b = Self { timeout, sender: b_sender, receiver: b_receiver };
+        let a = Self {
+            timeout,
+            sender: a_sender,
+            receiver: a_receiver,
+        };
+        let b = Self {
+            timeout,
+            sender: b_sender,
+            receiver: b_receiver,
+        };
         (a, b)
     }
 
@@ -101,7 +105,7 @@ impl<T> SyncQueue<T> {
         self.sender.send(value)
     }
 
-    #[inline(always)]    
+    #[inline(always)]
     pub fn pop(&mut self) -> Result<T, mpsc::RecvTimeoutError> {
         self.receiver.recv_timeout(self.timeout)
     }
@@ -116,12 +120,25 @@ const ACQUIRE_TIMEOUT: u32 = 10;
 const QUEUE_TIMEOUT: Duration = Duration::from_millis(200);
 const NUM_BUFFERS: usize = 2;
 
+// NOTE: cursor movements also generate frames, should these frames be ignored? since they bloat the FPS
+// can also be resolved by disabling the cursor and drawing it manually...
+
 fn spawn_encoder_thread(
     mut duplication: DxgiDuplicationApi,
     mut queue: SyncQueue<BitStream>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn({
         move || {
+            #[derive(Default, Debug)]
+            struct Stats {
+                pop: Duration,
+                acquire: Duration,
+                register: Duration,
+                encode: Duration,
+                push: Duration,
+            }
+            let mut stats = Stats::default();
+
             let encoder = create_encoder(duplication.device(), WIDTH, HEIGHT, FRAME_RATE, BITRATE);
             for _ in 0..NUM_BUFFERS {
                 queue
@@ -132,7 +149,12 @@ fn spawn_encoder_thread(
             let mut last = Instant::now();
             let mut i = 0;
             while i < 600 {
-//                println!("Frame: {i}");
+                // On any sane operating system, printing to the console would not make a difference.
+                // However, this is Windows, so it miraculously improves performance, allowing the
+                // DXGI Desktop Duplication API to capture at the monitor's framerate.
+                println!("<duvet_bugfix>");
+
+                // println!("Frame: {i}");
 
                 let before_pop = Instant::now();
                 let output = loop {
@@ -140,14 +162,15 @@ fn spawn_encoder_thread(
                         Ok(output) => break output,
                         Err(mpsc::RecvTimeoutError::Timeout) => {
                             println!("Timed out waiting for empty buffer for frame {i}");
-                        },
+                        }
                         Err(err) => {
                             println!("Failed to pop buffer from queue");
                             return;
                         }
                     }
                 };
-//                println!("  Waiting for empty buffer took {:?}", before_pop.elapsed());
+                stats.pop += before_pop.elapsed();
+                //                println!("  Waiting for empty buffer took {:?}", before_pop.elapsed());
 
                 let before_acquire = Instant::now();
                 let frame = loop {
@@ -159,15 +182,18 @@ fn spawn_encoder_thread(
                         Err(err) => panic!("Failed to capture frame {i}: {err}"),
                     }
                 };
-//                println!("  Acquiring frame took {:?}", before_acquire.elapsed());
+                stats.acquire += before_acquire.elapsed();
+                //                println!("  Acquiring frame took {:?}", before_acquire.elapsed());
 
                 let before_register = Instant::now();
                 // NOTE: should this texture be copied to another texture before giving it to the encoder?
+                //       would probably allow ReleaseFrame to be called a lot earlier...
                 let texture = frame.texture();
                 let registered = encoder
                     .register_resource_dx11(texture, NVencBufferFormat::ARGB, 0)
                     .unwrap();
-//                println!("  Texture registration took {:?}", before_register.elapsed());
+                stats.register += before_register.elapsed();
+                //                println!("  Texture registration took {:?}", before_register.elapsed());
 
                 let before_encode = Instant::now();
                 encoder
@@ -182,16 +208,28 @@ fn spawn_encoder_thread(
                         None,
                     )
                     .unwrap();
-//                println!("  Sending the encode command took {:?}", before_encode.elapsed());
+                stats.encode += before_encode.elapsed();
+                //                println!("  Sending the encode command took {:?}", before_encode.elapsed());
 
                 let before_push = Instant::now();
                 queue.push(output).unwrap();
-//                println!("  Pushing to the queue took {:?}", before_push.elapsed());
+                stats.push += before_push.elapsed();
+                //                println!("  Pushing to the queue took {:?}", before_push.elapsed());
 
                 i += 1;
-//                println!("  {:?} since last frame", last.elapsed());
+                // println!("  {:?} since last frame", last.elapsed());
                 last = Instant::now();
             }
+            println!("Total time: {:?}", instant.elapsed());
+            println!("Total stats: {:?}", stats);
+            println!(
+                "Average stats: Stats {{ pop: {:?}, acquire {:?}, register: {:?}, encode: {:?}, push: {:?} }}",
+                stats.pop / 600,
+                stats.acquire / 600,
+                stats.register / 600,
+                stats.encode / 600,
+                stats.push / 600,
+            );
             println!("Average FPS: {:?}", 600.0 / instant.elapsed().as_secs_f64());
         }
     })
@@ -221,7 +259,7 @@ fn main() {
         // let lock = output.try_lock(true).unwrap();
         // let data = lock.as_slice().to_vec();
         // drop(lock);
-//        println!("Read {} bytes of data in {:?}", data.len(), before_lock.elapsed());
+        //        println!("Read {} bytes of data in {:?}", data.len(), before_lock.elapsed());
         if let Err(_) = queue.push(output) {
             println!("Aux thread exited unexpectedly");
             break;
