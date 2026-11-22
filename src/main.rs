@@ -1,4 +1,4 @@
-use std::time::Instant;
+use std::time::{Instant, Duration};
 use std::sync::mpsc;
 
 use nvenc::bitstream::BitStream;
@@ -81,35 +81,39 @@ fn create_encoder(
 }
 
 struct SyncQueue<T> {
+    timeout: Duration,
     sender: mpsc::SyncSender<T>,
     receiver: mpsc::Receiver<T>,
 }
 
 impl<T> SyncQueue<T> {
-    pub fn new(capacity: usize) -> (Self, Self) {
+    pub fn new(capacity: usize, timeout: Duration) -> (Self, Self) {
         // Create bidirectional channel as two unidirectional channels
         let (a_sender, b_receiver) = mpsc::sync_channel(capacity);
         let (b_sender, a_receiver) = mpsc::sync_channel(capacity);
-        let a = Self { sender: a_sender, receiver: a_receiver };
-        let b = Self { sender: b_sender, receiver: b_receiver };
+        let a = Self { timeout, sender: a_sender, receiver: a_receiver };
+        let b = Self { timeout, sender: b_sender, receiver: b_receiver };
         (a, b)
     }
 
+    #[inline(always)]
     pub fn push(&mut self, value: T) -> Result<(), mpsc::SendError<T>> {
         self.sender.send(value)
     }
 
-    pub fn pop(&mut self) -> Result<T, mpsc::RecvError> {
-        self.receiver.recv()
+    #[inline(always)]    
+    pub fn pop(&mut self) -> Result<T, mpsc::RecvTimeoutError> {
+        self.receiver.recv_timeout(self.timeout)
     }
 }
 
 // TODO: resize if input resolution is different from configured resolution
-const WIDTH: u32 = 1920;
-const HEIGHT: u32 = 1080;
+const WIDTH: u32 = 2560;
+const HEIGHT: u32 = 1440;
 const FRAME_RATE: u32 = 75;
 const BITRATE: u32 = 10_000_000;
-const TIMEOUT: u32 = 10000;
+const ACQUIRE_TIMEOUT: u32 = 10;
+const QUEUE_TIMEOUT: Duration = Duration::from_millis(200);
 const NUM_BUFFERS: usize = 2;
 
 fn spawn_encoder_thread(
@@ -125,32 +129,68 @@ fn spawn_encoder_thread(
                     .unwrap();
             }
             let instant = Instant::now();
+            let mut last = Instant::now();
             let mut i = 0;
             while i < 600 {
-                if let Ok(output) = queue.pop() {
-                    println!("Frame: {i}");
-                    let frame = duplication.acquire_next_frame(TIMEOUT).unwrap();
-                    // NOTE: should this texture be copied to another texture before giving it to the encoder?
-                    let texture = frame.texture();
-                    let registered = encoder
-                        .register_resource_dx11(&texture, NVencBufferFormat::ARGB, 0)
-                        .unwrap();
+//                println!("Frame: {i}");
 
-                    encoder
-                        .encode_picture(
-                            &registered,
-                            &output,
-                            i,
-                            instant.elapsed().as_millis() as u64,
-                            NVencBufferFormat::ARGB,
-                            NVencPicStruct::Frame,
-                            NVencPicType::P,
-                            None,
-                        )
-                        .unwrap();
-                    queue.push(output).unwrap();
-                    i += 1;
-                }
+                let before_pop = Instant::now();
+                let output = loop {
+                    match queue.pop() {
+                        Ok(output) => break output,
+                        Err(mpsc::RecvTimeoutError::Timeout) => {
+                            println!("Timed out waiting for empty buffer for frame {i}");
+                        },
+                        Err(err) => {
+                            println!("Failed to pop buffer from queue");
+                            return;
+                        }
+                    }
+                };
+//                println!("  Waiting for empty buffer took {:?}", before_pop.elapsed());
+
+                let before_acquire = Instant::now();
+                let frame = loop {
+                    match duplication.acquire_next_frame(ACQUIRE_TIMEOUT) {
+                        Ok(frame) => break frame,
+                        Err(windows_capture::dxgi_duplication_api::Error::Timeout) => {
+                            println!("Timed out while capturing frame {i}");
+                        }
+                        Err(err) => panic!("Failed to capture frame {i}: {err}"),
+                    }
+                };
+//                println!("  Acquiring frame took {:?}", before_acquire.elapsed());
+
+                let before_register = Instant::now();
+                // NOTE: should this texture be copied to another texture before giving it to the encoder?
+                let texture = frame.texture();
+                let registered = encoder
+                    .register_resource_dx11(texture, NVencBufferFormat::ARGB, 0)
+                    .unwrap();
+//                println!("  Texture registration took {:?}", before_register.elapsed());
+
+                let before_encode = Instant::now();
+                encoder
+                    .encode_picture(
+                        &registered,
+                        &output,
+                        i,
+                        instant.elapsed().as_millis() as u64,
+                        NVencBufferFormat::ARGB,
+                        NVencPicStruct::Frame,
+                        NVencPicType::P,
+                        None,
+                    )
+                    .unwrap();
+//                println!("  Sending the encode command took {:?}", before_encode.elapsed());
+
+                let before_push = Instant::now();
+                queue.push(output).unwrap();
+//                println!("  Pushing to the queue took {:?}", before_push.elapsed());
+
+                i += 1;
+//                println!("  {:?} since last frame", last.elapsed());
+                last = Instant::now();
             }
             println!("Average FPS: {:?}", 600.0 / instant.elapsed().as_secs_f64());
         }
@@ -160,21 +200,35 @@ fn spawn_encoder_thread(
 fn main() {
     let monitor = Monitor::primary().unwrap();
     let duplication = DxgiDuplicationApi::new(monitor).unwrap();
-    let (mut queue, aux_queue) = SyncQueue::new(NUM_BUFFERS);
+    let (mut queue, aux_queue) = SyncQueue::new(NUM_BUFFERS, QUEUE_TIMEOUT);
     let handle = spawn_encoder_thread(duplication, aux_queue);
     // First NUM_BUFFERS buffers are uninitialized.
     for _ in 0..NUM_BUFFERS {
         let output = queue.pop().unwrap();
         queue.push(output).unwrap();
     }
-    while let Ok(output) = queue.pop() {
-        let lock = output.try_lock(true).unwrap();
-        let data = lock.as_slice().to_vec();
-        drop(lock);
-        println!("{} bytes of data", data.len());
+    'outer: loop {
+        let output = loop {
+            match queue.pop() {
+                Ok(output) => break output,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    println!("Timed out waiting for full buffer");
+                }
+                Err(_) => break 'outer,
+            }
+        };
+        let before_lock = Instant::now();
+        // let lock = output.try_lock(true).unwrap();
+        // let data = lock.as_slice().to_vec();
+        // drop(lock);
+//        println!("Read {} bytes of data in {:?}", data.len(), before_lock.elapsed());
         if let Err(_) = queue.push(output) {
+            println!("Aux thread exited unexpectedly");
             break;
         }
     }
-    handle.join().unwrap();
+    if let Err(err) = handle.join() {
+        println!("Failed to join aux thread");
+        std::panic::resume_unwind(err);
+    }
 }
