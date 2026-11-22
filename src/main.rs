@@ -2,7 +2,7 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use nvenc::bitstream::BitStream;
-use nvenc::encoder::Encoder as NvEncoder;
+use nvenc::encoder::Encoder as NVEncoder;
 use nvenc::session::InitParams;
 use nvenc::{
     session::Session,
@@ -32,7 +32,7 @@ fn create_encoder(
     height: u32,
     frame_rate: u32,
     average_bitrate: u32,
-) -> NvEncoder {
+) -> NVEncoder {
     let gcd = gcd(width, height);
     let aspect_ratio = [width / gcd, height / gcd];
     let session: Session<nvenc::session::NeedsConfig> = Session::open_dx(device).unwrap();
@@ -112,13 +112,15 @@ impl<T> SyncQueue<T> {
 }
 
 // TODO: resize if input resolution is different from configured resolution
-const WIDTH: u32 = 2560;
-const HEIGHT: u32 = 1440;
+const WIDTH: u32 = 1920;
+const HEIGHT: u32 = 1080;
 const FRAME_RATE: u32 = 75;
 const BITRATE: u32 = 10_000_000;
 const ACQUIRE_TIMEOUT: u32 = 10;
-const QUEUE_TIMEOUT: Duration = Duration::from_millis(200);
-const NUM_BUFFERS: usize = 2;
+// More than one buffer is theoretically more performant, but I have not observed any performance issues
+// and it seems to randomly deadlock with more than one buffer.
+const NUM_BUFFERS: usize = 1;
+const NUM_FRAMES: u32 = 600;
 
 // NOTE: cursor movements also generate frames, should these frames be ignored? since they bloat the FPS
 // can also be resolved by disabling the cursor and drawing it manually...
@@ -147,15 +149,7 @@ fn spawn_encoder_thread(
             }
             let instant = Instant::now();
             let mut last = Instant::now();
-            let mut i = 0;
-            while i < 600 {
-                // On any sane operating system, printing to the console would not make a difference.
-                // However, this is Windows, so it miraculously improves performance, allowing the
-                // DXGI Desktop Duplication API to capture at the monitor's framerate.
-                println!("<duvet_bugfix>");
-
-                // println!("Frame: {i}");
-
+            for i in 0..NUM_FRAMES {
                 let before_pop = Instant::now();
                 let output = loop {
                     match queue.pop() {
@@ -170,7 +164,6 @@ fn spawn_encoder_thread(
                     }
                 };
                 stats.pop += before_pop.elapsed();
-                //                println!("  Waiting for empty buffer took {:?}", before_pop.elapsed());
 
                 let before_acquire = Instant::now();
                 let frame = loop {
@@ -183,7 +176,6 @@ fn spawn_encoder_thread(
                     }
                 };
                 stats.acquire += before_acquire.elapsed();
-                //                println!("  Acquiring frame took {:?}", before_acquire.elapsed());
 
                 let before_register = Instant::now();
                 // NOTE: should this texture be copied to another texture before giving it to the encoder?
@@ -193,14 +185,13 @@ fn spawn_encoder_thread(
                     .register_resource_dx11(texture, NVencBufferFormat::ARGB, 0)
                     .unwrap();
                 stats.register += before_register.elapsed();
-                //                println!("  Texture registration took {:?}", before_register.elapsed());
 
                 let before_encode = Instant::now();
                 encoder
                     .encode_picture(
                         &registered,
                         &output,
-                        i,
+                        i as _,
                         instant.elapsed().as_millis() as u64,
                         NVencBufferFormat::ARGB,
                         NVencPicStruct::Frame,
@@ -209,28 +200,23 @@ fn spawn_encoder_thread(
                     )
                     .unwrap();
                 stats.encode += before_encode.elapsed();
-                //                println!("  Sending the encode command took {:?}", before_encode.elapsed());
 
                 let before_push = Instant::now();
                 queue.push(output).unwrap();
                 stats.push += before_push.elapsed();
-                //                println!("  Pushing to the queue took {:?}", before_push.elapsed());
-
-                i += 1;
-                // println!("  {:?} since last frame", last.elapsed());
                 last = Instant::now();
             }
             println!("Total time: {:?}", instant.elapsed());
             println!("Total stats: {:?}", stats);
             println!(
                 "Average stats: Stats {{ pop: {:?}, acquire {:?}, register: {:?}, encode: {:?}, push: {:?} }}",
-                stats.pop / 600,
-                stats.acquire / 600,
-                stats.register / 600,
-                stats.encode / 600,
-                stats.push / 600,
+                stats.pop / NUM_FRAMES,
+                stats.acquire / NUM_FRAMES,
+                stats.register / NUM_FRAMES,
+                stats.encode / NUM_FRAMES,
+                stats.push / NUM_FRAMES,
             );
-            println!("Average FPS: {:?}", 600.0 / instant.elapsed().as_secs_f64());
+            println!("Average FPS: {:?}", NUM_FRAMES as f64 / instant.elapsed().as_secs_f64());
         }
     })
 }
@@ -238,11 +224,22 @@ fn spawn_encoder_thread(
 fn main() {
     let monitor = Monitor::primary().unwrap();
     let duplication = DxgiDuplicationApi::new(monitor).unwrap();
-    let (mut queue, aux_queue) = SyncQueue::new(NUM_BUFFERS, QUEUE_TIMEOUT);
+    let (mut queue, aux_queue) = SyncQueue::new(
+        NUM_BUFFERS,
+        Duration::from_secs(1) / FRAME_RATE + Duration::from_millis(1),
+    );
     let handle = spawn_encoder_thread(duplication, aux_queue);
     // First NUM_BUFFERS buffers are uninitialized.
     for _ in 0..NUM_BUFFERS {
-        let output = queue.pop().unwrap();
+        let output = loop {
+            match queue.pop() {
+                Ok(output) => break output,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    println!("Timed out waiting for initial buffer");
+                }
+                Err(err) => panic!("Error waiting for initial buffer: {err}"),
+            }
+        };
         queue.push(output).unwrap();
     }
     'outer: loop {
@@ -256,12 +253,13 @@ fn main() {
             }
         };
         let before_lock = Instant::now();
-        // let lock = output.try_lock(true).unwrap();
-        // let data = lock.as_slice().to_vec();
-        // drop(lock);
-        //        println!("Read {} bytes of data in {:?}", data.len(), before_lock.elapsed());
+        // try_lock(wait) should have wait=true, since we use the synchronous NVenc mode.
+        let lock = output.try_lock(true).unwrap();
+        let data = lock.as_slice().to_vec();
+        drop(lock);
+        println!("Read {} bytes of data in {:?}", data.len(), before_lock.elapsed());
         if let Err(_) = queue.push(output) {
-            println!("Aux thread exited unexpectedly");
+            println!("Aux thread exited ");
             break;
         }
     }
