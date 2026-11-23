@@ -1,6 +1,6 @@
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use std::fs::File;
 use std::io::Write;
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 const RESOLUTION: (u32, u32) = (1920, 1080);
 const FRAME_RATE: u32 = 60;
