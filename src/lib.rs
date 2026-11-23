@@ -64,6 +64,21 @@ pub fn capture(
     })
 }
 
+pub struct ScreenInfo {
+    pub width: u32,
+    pub height: u32,
+    pub frame_rate: u32,
+}
+
+pub fn screen_info() -> Result<ScreenInfo, Error> {
+    let monitor = Monitor::primary()?;
+    Ok(ScreenInfo {
+        width: monitor.width()?,
+        height: monitor.height()?,
+        frame_rate: monitor.refresh_rate()?,
+    })
+}
+
 fn create_encoder(
     device: &ID3D11Device,
     (width, height): (u32, u32),
