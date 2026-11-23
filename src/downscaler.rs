@@ -1,15 +1,15 @@
+use tracing::debug;
 use windows::{
     Win32::Graphics::{Direct3D::Fxc::D3DCompile, Direct3D11::*, Dxgi::Common::DXGI_SAMPLE_DESC},
     core::{PCSTR, Result},
 };
-use tracing::debug;
 
 fn create_resized_texture(
     device: &ID3D11Device,
     src_texture: &ID3D11Texture2D,
     target_resolution: (u32, u32),
 ) -> Result<ID3D11Texture2D> {
-    debug!("Creating destination texture");    
+    debug!("Creating destination texture");
     let (target_width, target_height) = target_resolution;
     unsafe {
         let mut src_desc = D3D11_TEXTURE2D_DESC::default();
@@ -87,7 +87,7 @@ void CSMain(uint3 id : SV_DispatchThreadID)
 }
 
 fn create_sampler(device: &ID3D11Device) -> Result<ID3D11SamplerState> {
-    debug!("Creating sampler");    
+    debug!("Creating sampler");
     unsafe {
         let desc = D3D11_SAMPLER_DESC {
             Filter: D3D11_FILTER_MIN_MAG_LINEAR_MIP_POINT,

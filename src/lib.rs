@@ -11,7 +11,7 @@ use ::nvenc::{
         guids::{NV_ENC_CODEC_H264_GUID, NV_ENC_PRESET_P3_GUID},
     },
 };
-use tracing::{debug, info, warn, error};
+use tracing::{debug, error, info, warn};
 use windows::Win32::Graphics::Direct3D11::*;
 use windows_capture::{dxgi_duplication_api::DxgiDuplicationApi, monitor::Monitor};
 
