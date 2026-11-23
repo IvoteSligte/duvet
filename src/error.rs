@@ -1,4 +1,31 @@
-use nvenc::sys::result::NVencError as RawError;
+use nvenc::sys::result::NVencError as RawNVEncError;
+
+#[derive(thiserror::Error, Debug)]
+pub enum Error {
+    #[error("Device does not support H.264 encoding")]
+    UnsupportedCodec,
+
+    #[error("Windows error: {0}")]
+    Windows(#[from] windows::core::Error),
+
+    #[error("NVENC error: {0:?}")]
+    NVEnc(#[from] NVEncError),
+
+    #[error("The other end of an MPSC channel disconnected")]
+    ChannelDisconnected,
+
+    #[error(transparent)]
+    DxgiDuplication(#[from] windows_capture::dxgi_duplication_api::Error),
+
+    #[error(transparent)]
+    Monitor(#[from] windows_capture::monitor::Error),
+}
+
+impl From<::nvenc::sys::result::NVencError> for Error {
+    fn from(value: ::nvenc::sys::result::NVencError) -> Self {
+        Self::NVEnc(value.into())
+    }
+}
 
 #[derive(thiserror::Error, Debug)]
 pub enum NVEncError {
@@ -56,12 +83,12 @@ pub enum NVEncError {
     NeedMoreOutput,
 }
 
-impl From<RawError> for NVEncError {
-    fn from(raw: RawError) -> Self {
+impl From<RawNVEncError> for NVEncError {
+    fn from(raw: RawNVEncError) -> Self {
         macro_rules! map {
             (match ($raw:expr) { $($variant:ident,)* }) => {
                 match $raw {
-                    $(RawError::$variant => Self::$variant,)*
+                    $(RawNVEncError::$variant => Self::$variant,)*
                 }
             }
         }

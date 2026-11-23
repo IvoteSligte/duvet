@@ -1,17 +1,11 @@
-mod nvenc;
-mod util;
-
-use ::nvenc::session::NeedsConfig;
-use nvenc::NVEncError;
-use util::{SyncQueue, gcd};
-
 use std::sync::mpsc;
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use ::nvenc::{
     bitstream::BitStream,
     encoder::Encoder as NVEncoder,
-    session::{InitParams, Session},
+    session::{InitParams, NeedsConfig, Session},
     sys::{
         enums::*,
         guids::{NV_ENC_CODEC_H264_GUID, NV_ENC_PRESET_P3_GUID},
@@ -21,34 +15,56 @@ use log::{debug, info, warn};
 use windows::Win32::Graphics::Direct3D11::*;
 use windows_capture::{dxgi_duplication_api::DxgiDuplicationApi, monitor::Monitor};
 
-#[derive(thiserror::Error, Debug)]
-pub enum Error {
-    #[error("Device does not support H.264 encoding")]
-    UnsupportedCodec,
+use downscaler::downscale;
+use util::{FrameRateLimiter, SyncQueue, gcd};
 
-    #[error("NVENC error: {0:?}")]
-    NVEnc(#[from] NVEncError),
+mod downscaler;
+mod error;
+mod util;
 
-    #[error("The other end of an MPSC channel disconnected")]
-    ChannelDisconnected,
+pub use error::Error;
 
-    #[error(transparent)]
-    DxgiDuplication(#[from] windows_capture::dxgi_duplication_api::Error),
-
-    #[error(transparent)]
-    Monitor(#[from] windows_capture::monitor::Error),
-}
-
-impl From<::nvenc::sys::result::NVencError> for Error {
-    fn from(value: ::nvenc::sys::result::NVencError) -> Self {
-        Self::NVEnc(value.into())
+/// The returned H.264 video stream has a resolution of at most `resolution` pixels
+/// and a frame-rate of roughly `frame_rate` FPS.
+pub fn capture(
+    resolution: (u32, u32),
+    frame_rate: u32,
+    bitrate: u32,
+) -> Result<impl Iterator<Item = Result<Vec<u8>, Error>>, Error> {
+    let monitor = Monitor::primary()?;
+    let duplication = DxgiDuplicationApi::new(monitor)?;
+    let timeout = Duration::from_secs(1) / frame_rate + Duration::from_millis(1);
+    let (mut queue, aux_queue) = SyncQueue::new(NUM_BUFFERS, timeout);
+    let handle = spawn_encoder_thread(
+        duplication,
+        aux_queue,
+        resolution,
+        frame_rate,
+        bitrate,
+        timeout,
+    );
+    // First NUM_BUFFERS buffers are uninitialized.
+    for _ in 0..NUM_BUFFERS {
+        let output = loop {
+            match queue.pop() {
+                Ok(output) => break output,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    debug!("Timed out waiting for initial buffer");
+                }
+                Err(_) => return Err(Error::ChannelDisconnected),
+            }
+        };
+        queue.push(output).map_err(|_| Error::ChannelDisconnected)?;
     }
+    Ok(Iter {
+        handle: Some(handle),
+        queue,
+    })
 }
 
 fn create_encoder(
     device: &ID3D11Device,
-    width: u32,
-    height: u32,
+    (width, height): (u32, u32),
     frame_rate: u32,
     average_bitrate: u32,
 ) -> Result<NVEncoder, Error> {
@@ -94,8 +110,6 @@ fn create_encoder(
     Ok(session.init_encoder(init_params)?)
 }
 
-// TODO: downscale and drop frames if input resolution/FPS is different from configured resolution/FPS
-
 // More than one buffer is theoretically more performant, but I have not observed any performance issues
 // and it seems to randomly deadlock with more than one buffer.
 const NUM_BUFFERS: usize = 1;
@@ -106,20 +120,21 @@ const NUM_BUFFERS: usize = 1;
 fn spawn_encoder_thread(
     mut duplication: DxgiDuplicationApi,
     mut queue: SyncQueue<BitStream>,
-    (width, height): (u32, u32),
+    resolution: (u32, u32),
     frame_rate: u32,
     bitrate: u32,
     timeout: Duration,
-) -> std::thread::JoinHandle<Result<(), Error>> {
+) -> JoinHandle<Result<(), Error>> {
     std::thread::spawn({
         move || -> Result<(), Error> {
-            let encoder = create_encoder(duplication.device(), width, height, frame_rate, bitrate)?;
+            let encoder = create_encoder(duplication.device(), resolution, frame_rate, bitrate)?;
             for _ in 0..NUM_BUFFERS {
                 queue
                     .push(encoder.create_bitstream_buffer()?)
                     .map_err(|_| Error::ChannelDisconnected)?;
             }
-            let instant = Instant::now();
+            let mut frame_rate_limiter = FrameRateLimiter::new(frame_rate);
+            let start_instant = Instant::now();
             for i in 0.. {
                 let output = loop {
                     match queue.pop() {
@@ -133,6 +148,7 @@ fn spawn_encoder_thread(
                         }
                     }
                 };
+                frame_rate_limiter.step();
                 let frame = loop {
                     match duplication.acquire_next_frame(timeout.as_millis() as _) {
                         Ok(frame) => break frame,
@@ -142,16 +158,19 @@ fn spawn_encoder_thread(
                         Err(err) => panic!("Failed to capture frame {i}: {err}"),
                     }
                 };
-                // NOTE: should this texture be copied to another texture before giving it to the encoder?
-                //       would probably allow ReleaseFrame to be called a lot earlier...
-                let texture = frame.texture();
+                let texture = downscale(
+                    frame.device(),
+                    frame.device_context(),
+                    frame.texture(),
+                    resolution,
+                )?;
                 let registered =
-                    encoder.register_resource_dx11(texture, NVencBufferFormat::ARGB, 0)?;
+                    encoder.register_resource_dx11(&texture, NVencBufferFormat::ARGB, 0)?;
                 encoder.encode_picture(
                     &registered,
                     &output,
                     i,
-                    instant.elapsed().as_millis() as u64,
+                    start_instant.elapsed().as_millis() as u64,
                     NVencBufferFormat::ARGB,
                     NVencPicStruct::Frame,
                     NVencPicType::P,
@@ -164,62 +183,51 @@ fn spawn_encoder_thread(
     })
 }
 
-/// The returned H.264 video stream has a resolution of at most `resolution` pixels
-/// and a frame-rate of at most `frame_rate` FPS.
-pub fn capture(resolution: (u32, u32), frame_rate: u32, bitrate: u32) -> Result<(), Error> {
-    let monitor = Monitor::primary()?;
-    let duplication = DxgiDuplicationApi::new(monitor)?;
-    let timeout = Duration::from_secs(1) / frame_rate + Duration::from_millis(1);
-    let (mut queue, aux_queue) = SyncQueue::new(NUM_BUFFERS, timeout);
-    let handle = spawn_encoder_thread(
-        duplication,
-        aux_queue,
-        resolution,
-        frame_rate,
-        bitrate,
-        timeout,
-    );
-    // First NUM_BUFFERS buffers are uninitialized.
-    for _ in 0..NUM_BUFFERS {
+struct Iter {
+    handle: Option<JoinHandle<Result<(), Error>>>,
+    queue: SyncQueue<BitStream>,
+}
+
+impl Iterator for Iter {
+    type Item = Result<Vec<u8>, Error>;
+
+    fn next(&mut self) -> Option<Self::Item> {
         let output = loop {
-            match queue.pop() {
-                Ok(output) => break output,
-                Err(mpsc::RecvTimeoutError::Timeout) => {
-                    debug!("Timed out waiting for initial buffer");
-                }
-                Err(_) => return Err(Error::ChannelDisconnected),
-            }
-        };
-        queue.push(output).map_err(|_| Error::ChannelDisconnected)?;
-    }
-    'outer: loop {
-        let output = loop {
-            match queue.pop() {
+            match self.queue.pop() {
                 Ok(output) => break output,
                 Err(mpsc::RecvTimeoutError::Timeout) => {
                     debug!("Timed out waiting for full buffer");
                 }
-                Err(_) => break 'outer,
+                Err(_) => return None,
             }
         };
         let before_lock = Instant::now();
         // try_lock(wait) should have wait=true, since we use the synchronous NVenc mode.
-        let lock = output.try_lock(true)?;
-        let data = lock.as_slice().to_vec();
-        drop(lock);
-        debug!(
-            "Read {} bytes of data in {:?}",
-            data.len(),
-            before_lock.elapsed()
-        );
-        if let Err(_) = queue.push(output) {
+        let result = match output.try_lock(true) {
+            Ok(lock) => {
+                let data = lock.as_slice().to_vec();
+                debug!(
+                    "Read {} bytes of data in {:?}",
+                    data.len(),
+                    before_lock.elapsed()
+                );
+                Ok(data)
+            }
+            Err(err) => Err(err.into()),
+        };
+        if let Err(_) = self.queue.push(output) {
             warn!("Encoder thread exited");
-            break;
+            return None;
+        }
+        Some(result)
+    }
+}
+
+impl Drop for Iter {
+    fn drop(&mut self) {
+        if let Err(err) = self.handle.take().unwrap().join() {
+            println!("Failed to join aux thread");
+            std::panic::resume_unwind(err);
         }
     }
-    if let Err(err) = handle.join() {
-        println!("Failed to join aux thread");
-        std::panic::resume_unwind(err);
-    }
-    Ok(())
 }

@@ -7,5 +7,6 @@ edition = "2024"
 log = "0.4.35"
 nvenc = "0.1.0"
 thiserror = "2.0.21"
-windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_Graphics_Direct3D", "Win32_Graphics_Direct3D11", "Win32_Graphics_Dxgi", "Win32_Graphics_Dxgi_Common"] }
+windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_Graphics_Direct3D", "Win32_Graphics_Direct3D11", "Win32_Graphics_Direct3D_Fxc", "Win32_Graphics_Dxgi", "Win32_Graphics_Dxgi_Common"] }
 windows-capture = "2.0.1"
+fps_ticker = { git = "https://github.com/IvoteSligte/fps_ticker.git", version = "1.0.0" }

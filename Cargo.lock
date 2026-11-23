@@ -64,6 +64,7 @@ checksum = "a31eee39dddec8330830986fcd7625edb5a24ec90ea038215273bbc3adb08ac6"
 name = "duvet"
 version = "0.1.0"
 dependencies = [
+ "fps_ticker",
  "log",
  "nvenc",
  "thiserror",
@@ -76,6 +77,11 @@ name = "either"
 version = "1.19.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0e9c71c2167ca323c882b99918929403426e2373ea17242ff5653e0d5e1058be"
+
+[[package]]
+name = "fps_ticker"
+version = "1.0.0"
+source = "git+https://github.com/IvoteSligte/fps_ticker.git#71056f1f5897882a9c78ff2bde4c209d0d1259a5"
 
 [[package]]
 name = "libc"
