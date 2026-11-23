@@ -29,7 +29,7 @@ fn create_resized_texture(
                 Quality: 0,
             },
             Usage: D3D11_USAGE_DEFAULT,
-            BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as _,
+            BindFlags: (D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS).0 as _,
             CPUAccessFlags: 0,
             MiscFlags: 0,
         };
@@ -96,7 +96,7 @@ fn create_sampler(device: &ID3D11Device) -> Result<ID3D11SamplerState> {
             AddressW: D3D11_TEXTURE_ADDRESS_CLAMP,
             MipLODBias: 0.0,
             MaxAnisotropy: 1,
-            ComparisonFunc: D3D11_COMPARISON_NEVER,
+            ComparisonFunc: D3D11_COMPARISON_ALWAYS,
             BorderColor: [0.0; 4],
             MinLOD: 0.0,
             MaxLOD: 0.0,
@@ -107,19 +107,35 @@ fn create_sampler(device: &ID3D11Device) -> Result<ID3D11SamplerState> {
     }
 }
 
-fn create_view(
+fn create_shader_resource_view(
     device: &ID3D11Device,
     texture: &ID3D11Texture2D,
 ) -> Result<ID3D11ShaderResourceView> {
     debug!("Creating shader resource view");
     unsafe {
-        let mut src_view = None;
-        device.CreateShaderResourceView(texture, None, Some(&mut src_view))?;
-        Ok(src_view.unwrap())
+        let mut view = None;
+        device.CreateShaderResourceView(texture, None, Some(&mut view))?;
+        Ok(view.unwrap())
+    }
+}
+
+fn create_unordered_access_view(
+    device: &ID3D11Device,
+    texture: &ID3D11Texture2D,
+) -> Result<ID3D11UnorderedAccessView> {
+    debug!("Creating unordered access view");
+    unsafe {
+        let mut view = None;
+        device.CreateUnorderedAccessView(texture, None, Some(&mut view))?;
+        Ok(view.unwrap())
     }
 }
 
 // TODO: optimize
+/// Makes a few assumptions about `src_texture`:
+/// It must have a `float4`-compatible format.
+/// It may not be multi-sampled or have multiple MIP-levels.
+/// It must have the `D3D11_BIND_SHADER_RESOURCE` bind flag.
 pub fn downscale(
     device: &ID3D11Device,
     device_context: &ID3D11DeviceContext,
@@ -133,13 +149,14 @@ pub fn downscale(
     let shader = create_shader(device)?;
     let sampler = create_sampler(device)?;
     unsafe {
-        let src_view = create_view(device, src_texture)?;
-        let dst_view = create_view(device, &dst_texture)?;
+        let src_view = create_shader_resource_view(device, src_texture)?;
+        let dst_view = create_unordered_access_view(device, &dst_texture)?;
 
         device_context.CSSetShader(&shader, None);
         device_context.CSSetSamplers(0, Some(&[Some(sampler)]));
-        device_context.CSSetShaderResources(0, Some(&[Some(src_view), Some(dst_view)]));
-        device_context.Dispatch(width.next_multiple_of(8), height.next_multiple_of(8), 1);
+        device_context.CSSetShaderResources(0, Some(&[Some(src_view)]));
+        device_context.CSSetUnorderedAccessViews(0, 1, Some(&Some(dst_view)), None);
+        device_context.Dispatch(width.div_ceil(8), height.div_ceil(8), 1);
     }
     Ok(dst_texture)
 }
