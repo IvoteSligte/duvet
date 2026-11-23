@@ -1,19 +1,21 @@
 use windows::{
-    Win32::Graphics::{Direct3D::Fxc::D3DCompile, Direct3D11::*},
+    Win32::Graphics::{Direct3D::Fxc::D3DCompile, Direct3D11::*, Dxgi::Common::DXGI_SAMPLE_DESC},
     core::{PCSTR, Result},
 };
+use tracing::debug;
 
 fn create_resized_texture(
     device: &ID3D11Device,
     src_texture: &ID3D11Texture2D,
     target_resolution: (u32, u32),
 ) -> Result<ID3D11Texture2D> {
+    debug!("Creating destination texture");    
     let (target_width, target_height) = target_resolution;
     unsafe {
         let mut src_desc = D3D11_TEXTURE2D_DESC::default();
         src_texture.GetDesc(&mut src_desc);
         assert_eq!(src_desc.MipLevels, 1);
-        assert_eq!(src_desc.SampleDesc, Default::default());
+        assert_eq!(src_desc.SampleDesc.Count, 1);
         assert!(src_desc.BindFlags & D3D11_BIND_SHADER_RESOURCE.0 as u32 != 0);
 
         let desc = D3D11_TEXTURE2D_DESC {
@@ -22,9 +24,12 @@ fn create_resized_texture(
             MipLevels: 1,
             ArraySize: 1,
             Format: src_desc.Format,
-            SampleDesc: Default::default(),
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
             Usage: D3D11_USAGE_DEFAULT,
-            BindFlags: D3D11_BIND_RENDER_TARGET.0 as _,
+            BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as _,
             CPUAccessFlags: 0,
             MiscFlags: 0,
         };
@@ -36,14 +41,22 @@ fn create_resized_texture(
 }
 
 fn create_shader(device: &ID3D11Device) -> Result<ID3D11ComputeShader> {
+    debug!("Creating compute shader");
     let source = b"
 Texture2D<float4> SrcTexture : register(t0);
 RWTexture2D<float4> DstTexture : register(u0);
 SamplerState LinearSampler : register(s0);
 
 [numthreads(8, 8, 1)]
-void CSMain(uint3 id : SV_DispatchThreadID) {
-    float2 uv = (float2(id.xy) + 0.5f) / float2(GetDimensions(DstTexture).xy);
+void CSMain(uint3 id : SV_DispatchThreadID)
+{
+    uint width, height;
+    DstTexture.GetDimensions(width, height);
+
+    if (id.x >= width || id.y >= height) {
+        return;
+    }
+    float2 uv = (float2(id.xy) + 0.5f) / float2(width, height);
     DstTexture[id.xy] = SrcTexture.SampleLevel(LinearSampler, uv, 0);
 }
 ";
@@ -74,6 +87,7 @@ void CSMain(uint3 id : SV_DispatchThreadID) {
 }
 
 fn create_sampler(device: &ID3D11Device) -> Result<ID3D11SamplerState> {
+    debug!("Creating sampler");    
     unsafe {
         let desc = D3D11_SAMPLER_DESC {
             Filter: D3D11_FILTER_MIN_MAG_LINEAR_MIP_POINT,
@@ -97,6 +111,7 @@ fn create_view(
     device: &ID3D11Device,
     texture: &ID3D11Texture2D,
 ) -> Result<ID3D11ShaderResourceView> {
+    debug!("Creating shader resource view");
     unsafe {
         let mut src_view = None;
         device.CreateShaderResourceView(texture, None, Some(&mut src_view))?;
@@ -111,13 +126,15 @@ pub fn downscale(
     src_texture: &ID3D11Texture2D,
     target_resolution: (u32, u32),
 ) -> Result<ID3D11Texture2D> {
+    let (width, height) = target_resolution;
+    debug!("Downscaling texture to {width}x{height}");
+
     let dst_texture = create_resized_texture(device, src_texture, target_resolution)?;
     let shader = create_shader(device)?;
     let sampler = create_sampler(device)?;
     unsafe {
         let src_view = create_view(device, src_texture)?;
         let dst_view = create_view(device, &dst_texture)?;
-        let (width, height) = target_resolution;
 
         device_context.CSSetShader(&shader, None);
         device_context.CSSetSamplers(0, Some(&[Some(sampler)]));

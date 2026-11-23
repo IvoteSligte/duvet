@@ -11,7 +11,7 @@ use ::nvenc::{
         guids::{NV_ENC_CODEC_H264_GUID, NV_ENC_PRESET_P3_GUID},
     },
 };
-use log::{debug, info, warn};
+use tracing::{debug, info, warn, error};
 use windows::Win32::Graphics::Direct3D11::*;
 use windows_capture::{dxgi_duplication_api::DxgiDuplicationApi, monitor::Monitor};
 
@@ -144,6 +144,8 @@ fn spawn_encoder_thread(
 ) -> JoinHandle<Result<(), Error>> {
     std::thread::spawn({
         move || -> Result<(), Error> {
+            info!("Spawned encoder thread");
+
             let encoder = create_encoder(duplication.device(), resolution, frame_rate, bitrate)?;
             for _ in 0..NUM_BUFFERS {
                 queue
@@ -243,9 +245,15 @@ impl Iterator for Iter {
 
 impl Drop for Iter {
     fn drop(&mut self) {
-        if let Err(err) = self.handle.take().unwrap().join() {
-            println!("Failed to join aux thread");
-            std::panic::resume_unwind(err);
+        match self.handle.take().unwrap().join() {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => {
+                error!("The encoder thread raised an error: {err}");
+            }
+            Err(join_err) => {
+                error!("Failed to join encoder thread");
+                std::panic::resume_unwind(join_err);
+            }
         }
     }
 }
