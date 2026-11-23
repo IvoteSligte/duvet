@@ -116,9 +116,8 @@ checksum = "5d15f86d12da44cd8d4ec3c73984537eb7f4cadcb9776a575a0a8a05ca11005c"
 
 [[package]]
 name = "nvenc"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3227c3b09b1e042dab7d8d82cea77c0404e7d0c2bbb92e7e87cb319749cd20dc"
+version = "0.1.1"
+source = "git+https://github.com/IvoteSligte/nvenc.git#8f6722717680776fcd0390ee90f609ecbd2511ab"
 dependencies = [
  "bitfields",
  "libloading",

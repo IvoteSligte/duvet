@@ -26,11 +26,13 @@ pub use error::Error;
 
 /// The returned H.264 video stream has a resolution of at most `resolution` pixels
 /// and a frame-rate of roughly `frame_rate` FPS.
+///
+/// Each frame consists of the encoded bytes and a boolean indicating if the frame is a keyframe.
 pub fn capture(
     resolution: (u32, u32),
     frame_rate: u32,
     bitrate: u32,
-) -> Result<impl Iterator<Item = Result<Vec<u8>, Error>>, Error> {
+) -> Result<impl Iterator<Item = Result<(Vec<u8>, bool), Error>>, Error> {
     let monitor = Monitor::primary()?;
     let duplication = DxgiDuplicationApi::new(monitor)?;
     let timeout = Duration::from_secs(1) / frame_rate + Duration::from_millis(1);
@@ -189,7 +191,7 @@ struct Iter {
 }
 
 impl Iterator for Iter {
-    type Item = Result<Vec<u8>, Error>;
+    type Item = Result<(Vec<u8>, bool), Error>;
 
     fn next(&mut self) -> Option<Self::Item> {
         let output = loop {
@@ -205,13 +207,14 @@ impl Iterator for Iter {
         // try_lock(wait) should have wait=true, since we use the synchronous NVenc mode.
         let result = match output.try_lock(true) {
             Ok(lock) => {
+                let is_keyframe = lock.picture_type() == NVencPicType::IDR;
                 let data = lock.as_slice().to_vec();
                 debug!(
                     "Read {} bytes of data in {:?}",
                     data.len(),
                     before_lock.elapsed()
                 );
-                Ok(data)
+                Ok((data, is_keyframe))
             }
             Err(err) => Err(err.into()),
         };
