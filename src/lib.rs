@@ -13,6 +13,7 @@ use ::nvenc::{
 };
 use tracing::{debug, error, info, warn};
 use windows::Win32::Graphics::Direct3D11::*;
+// TODO: rewrite windows_capture so it does not depend on rayon to reduce the number of (unused) dependencies
 use windows_capture::{dxgi_duplication_api::DxgiDuplicationApi, monitor::Monitor};
 
 use downscaler::downscale;
@@ -105,7 +106,7 @@ fn create_encoder(
         NV_ENC_PRESET_P3_GUID,
         NVencTuningInfo::LowLatency,
     )?;
-    config.preset_cfg.rc_params.rate_control_mode = NVencParamsRcMode::VBR;
+    config.preset_cfg.rc_params.rate_control_mode = NVencParamsRcMode::CBR;
     config.preset_cfg.rc_params.average_bit_rate = average_bitrate;
     config.preset_cfg.gop_len = 0xffffffff;
     config.preset_cfg.frame_interval_p = 1;
@@ -172,7 +173,7 @@ fn spawn_encoder_thread(
                     match duplication.acquire_next_frame(timeout.as_millis() as _) {
                         Ok(frame) => break frame,
                         Err(windows_capture::dxgi_duplication_api::Error::Timeout) => {
-                            println!("Timed out while capturing frame {i}");
+                            warn!("Timed out while capturing frame {i}");
                         }
                         Err(err) => panic!("Failed to capture frame {i}: {err}"),
                     }
@@ -185,6 +186,11 @@ fn spawn_encoder_thread(
                 )?;
                 let registered =
                     encoder.register_resource_dx11(&texture, NVencBufferFormat::ARGB, 0)?;
+                // TODO: provide an option for the user to manually insert IDRs instead of doing it automatically every second
+                let flags = match i % frame_rate as usize {
+                    0 => NVencPicFlags::FORCE_IDR,
+                    _ => NVencPicFlags::empty(),
+                };
                 encoder.encode_picture(
                     &registered,
                     &output,
@@ -193,6 +199,7 @@ fn spawn_encoder_thread(
                     NVencBufferFormat::ARGB,
                     NVencPicStruct::Frame,
                     NVencPicType::P,
+                    flags,
                     None,
                 )?;
                 queue.push(output).map_err(|_| Error::ChannelDisconnected)?;
@@ -224,12 +231,17 @@ impl Iterator for Iter {
         // try_lock(wait) should have wait=true, since we use the synchronous NVenc mode.
         let result = match output.try_lock(true) {
             Ok(lock) => {
-                let is_keyframe = lock.picture_type() == NVencPicType::IDR;
+                let picture_type = lock.picture_type();
+                if picture_type == NVencPicType::UNKNOWN {
+                    warn!("Unknown NVENC picture type generated.");
+                }
+                let is_keyframe = picture_type == NVencPicType::IDR;
                 let data = lock.as_slice().to_vec();
                 debug!(
-                    "Read {} bytes of data in {:?}",
+                    "Read {} bytes of data in {:?} (type: {:?})",
                     data.len(),
-                    before_lock.elapsed()
+                    before_lock.elapsed(),
+                    picture_type,
                 );
                 Ok((data, is_keyframe))
             }

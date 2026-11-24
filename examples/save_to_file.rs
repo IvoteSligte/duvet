@@ -18,16 +18,8 @@ fn main() {
 
     let mut file = File::create("capture.h264").unwrap();
 
-    for (i, frame_result) in duvet::capture(RESOLUTION, FRAME_RATE, BITRATE)
-        .unwrap()
-        .enumerate()
-    {
-        let (bytes, is_keyframe) = frame_result.unwrap();
-        println!(
-            "Captured frame {i}: bytes: {}, is keyframe: {}",
-            bytes.len(),
-            is_keyframe
-        );
+    for frame_result in duvet::capture(RESOLUTION, FRAME_RATE, BITRATE).unwrap() {
+        let (bytes, _is_keyframe) = frame_result.unwrap();
         file.write_all(&bytes).unwrap();
     }
 }

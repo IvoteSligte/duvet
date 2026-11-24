@@ -2,6 +2,7 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use fps_ticker::Fps;
+use tracing::debug;
 
 // Adapted from the gcd crate
 pub const fn gcd(a: u32, b: u32) -> u32 {
@@ -69,7 +70,10 @@ impl FrameRateLimiter {
         const STEP_SIZE: Duration = Duration::from_micros(100);
 
         self.fps.tick();
-        if self.fps.avg() > self.target_frame_rate as f64 {
+        let frame_rate = self.fps.avg();
+        debug!("FPS: {:.1}", frame_rate);
+
+        if frame_rate > self.target_frame_rate as f64 {
             self.sleep_duration += STEP_SIZE;
             std::thread::sleep(self.sleep_duration);
         } else if self.sleep_duration < STEP_SIZE {

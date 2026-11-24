@@ -13,15 +13,7 @@ fn main() {
         .with(tracing_subscriber::fmt::layer().without_time())
         .init();
 
-    for (i, frame_result) in duvet::capture(RESOLUTION, FRAME_RATE, BITRATE)
-        .unwrap()
-        .enumerate()
-    {
-        let (bytes, is_keyframe) = frame_result.unwrap();
-        println!(
-            "Captured frame {i}: bytes: {}, is keyframe: {}",
-            bytes.len(),
-            is_keyframe
-        );
+    for frame_result in duvet::capture(RESOLUTION, FRAME_RATE, BITRATE).unwrap() {
+        let (_bytes, _is_keyframe) = frame_result.unwrap();
     }
 }
