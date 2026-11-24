@@ -1,2 +1,4 @@
 /target
+Cargo.lock
+capture.h264
 .dir-locals.el

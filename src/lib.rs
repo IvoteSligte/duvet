@@ -12,11 +12,11 @@ use ::nvenc::{
     },
 };
 use tracing::{debug, error, info, warn};
-use windows::Win32::Graphics::Direct3D11::*;
+use windows::Win32::Graphics::{Direct3D11::*, Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM};
 // TODO: rewrite windows_capture so it does not depend on rayon to reduce the number of (unused) dependencies
 use windows_capture::{dxgi_duplication_api::DxgiDuplicationApi, monitor::Monitor};
 
-use downscaler::downscale;
+use downscaler::Downscaler;
 use util::{FrameRateLimiter, SyncQueue, gcd};
 
 mod downscaler;
@@ -147,7 +147,12 @@ fn spawn_encoder_thread(
         move || -> Result<(), Error> {
             info!("Spawned encoder thread");
 
-            let encoder = create_encoder(duplication.device(), resolution, frame_rate, bitrate)?;
+            let device = duplication.device();
+            let encoder = create_encoder(device, resolution, frame_rate, bitrate)?;
+            let downscaler = Downscaler::new(device, duplication.device_context().clone())?;
+            let output_texture =
+                Downscaler::create_output_texture(device, DXGI_FORMAT_B8G8R8A8_UNORM, resolution)?;
+            let output_view = Downscaler::create_output_view(device, &output_texture)?;
             for _ in 0..NUM_BUFFERS {
                 queue
                     .push(encoder.create_bitstream_buffer()?)
@@ -178,14 +183,10 @@ fn spawn_encoder_thread(
                         Err(err) => panic!("Failed to capture frame {i}: {err}"),
                     }
                 };
-                let texture = downscale(
-                    frame.device(),
-                    frame.device_context(),
-                    frame.texture(),
-                    resolution,
-                )?;
+                let input_view = Downscaler::create_input_view(frame.device(), frame.texture())?;
+                downscaler.downscale(input_view, output_view.clone(), resolution);
                 let registered =
-                    encoder.register_resource_dx11(&texture, NVencBufferFormat::ARGB, 0)?;
+                    encoder.register_resource_dx11(&output_texture, NVencBufferFormat::ARGB, 0)?;
                 // TODO: provide an option for the user to manually insert IDRs instead of doing it automatically every second
                 let flags = match i % frame_rate as usize {
                     0 => NVencPicFlags::FORCE_IDR,
