@@ -71,7 +71,7 @@ impl FrameRateLimiter {
 
         self.fps.tick();
         let frame_rate = self.fps.avg();
-        debug!("FPS: {:.1}", frame_rate);
+        debug!("FPS: {:.1}, sleep duration: {:?}", frame_rate, self.sleep_duration);
 
         if frame_rate > self.target_frame_rate as f64 {
             self.sleep_duration += STEP_SIZE;
