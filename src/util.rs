@@ -16,23 +16,20 @@ pub const fn gcd(a: u32, b: u32) -> u32 {
 }
 
 pub struct SyncQueue<T> {
-    timeout: Duration,
     sender: mpsc::SyncSender<T>,
     receiver: mpsc::Receiver<T>,
 }
 
 impl<T> SyncQueue<T> {
-    pub fn new(capacity: usize, timeout: Duration) -> (Self, Self) {
+    pub fn new(capacity: usize) -> (Self, Self) {
         // Create bidirectional channel as two unidirectional channels
         let (a_sender, b_receiver) = mpsc::sync_channel(capacity);
         let (b_sender, a_receiver) = mpsc::sync_channel(capacity);
         let a = Self {
-            timeout,
             sender: a_sender,
             receiver: a_receiver,
         };
         let b = Self {
-            timeout,
             sender: b_sender,
             receiver: b_receiver,
         };
@@ -45,8 +42,8 @@ impl<T> SyncQueue<T> {
     }
 
     #[inline(always)]
-    pub fn pop(&mut self) -> Result<T, mpsc::RecvTimeoutError> {
-        self.receiver.recv_timeout(self.timeout)
+    pub fn pop(&mut self) -> Result<T, mpsc::RecvError> {
+        self.receiver.recv()
     }
 }
 

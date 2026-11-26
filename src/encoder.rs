@@ -7,7 +7,7 @@ use ::nvenc::{
         guids::{NV_ENC_CODEC_H264_GUID, NV_ENC_PRESET_P3_GUID},
     },
 };
-use windows::Win32::Graphics::Direct3D11::{ID3D11Texture2D, ID3D11Device};
+use windows::Win32::Graphics::Direct3D11::{ID3D11Device, ID3D11Texture2D};
 
 use std::time::Instant;
 
@@ -31,7 +31,8 @@ impl Encoder {
         let session: Session<NeedsConfig> = Session::open_dx(device).unwrap();
         if !session
             .get_encode_codecs()?
-            .contains(&NV_ENC_CODEC_H264_GUID) || !session
+            .contains(&NV_ENC_CODEC_H264_GUID)
+            || !session
                 .get_encode_presets(NV_ENC_CODEC_H264_GUID)?
                 .contains(&NV_ENC_PRESET_P3_GUID)
         {
@@ -78,11 +79,9 @@ impl Encoder {
         output_buffer: &BitStream,
     ) -> Result<(), Error> {
         // TODO: register all the possible input textures in advance
-        let registered = self.inner.register_resource_dx11(
-            input_texture,
-            NVencBufferFormat::ARGB,
-            0,
-        )?;
+        let registered =
+            self.inner
+                .register_resource_dx11(input_texture, NVencBufferFormat::ARGB, 0)?;
         // TODO: provide an option for the user to manually insert IDRs instead of doing it automatically every second
         let flags = match frame_index % self.frame_rate as usize {
             0 => NVencPicFlags::FORCE_IDR,

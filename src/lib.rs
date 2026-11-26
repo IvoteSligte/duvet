@@ -1,13 +1,12 @@
-use std::sync::mpsc;
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use tracing::{debug, error, info, warn};
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 // TODO: rewrite windows_capture so it does not depend on rayon to reduce the number of (unused) dependencies
-use windows_capture::{dxgi_duplication_api::{DxgiDuplicationApi, DxgiDuplicationFrame}, monitor::Monitor};
 use ::nvenc::bitstream::BitStream;
-use ::nvenc::sys::enums::{NVencPicType, NVencBufferFormat};
+use ::nvenc::sys::enums::{NVencBufferFormat, NVencPicType};
+use windows_capture::{dxgi_duplication_api::DxgiDuplicationApi, monitor::Monitor};
 
 use downscaler::Downscaler;
 use encoder::Encoder;
@@ -31,27 +30,13 @@ pub fn capture(
 ) -> Result<impl Iterator<Item = Result<(Vec<u8>, bool), Error>>, Error> {
     let monitor = Monitor::primary()?;
     let duplication = DxgiDuplicationApi::new(monitor)?;
-    let timeout = Duration::from_secs(1) / frame_rate + Duration::from_millis(1);
-    let (mut queue, aux_queue) = SyncQueue::new(NUM_BUFFERS, timeout);
-    let handle = std::thread::spawn(move || run_encoder(
-        duplication,
-        aux_queue,
-        resolution,
-        frame_rate,
-        bitrate,
-        timeout,
-    ));
+    let (mut queue, aux_queue) = SyncQueue::new(NUM_BUFFERS);
+    let handle = std::thread::spawn(move || {
+        run_encoder(duplication, aux_queue, resolution, frame_rate, bitrate)
+    });
     // First NUM_BUFFERS buffers are uninitialized.
     for _ in 0..NUM_BUFFERS {
-        let output = loop {
-            match queue.pop() {
-                Ok(output) => break output,
-                Err(mpsc::RecvTimeoutError::Timeout) => {
-                    debug!("Timed out waiting for initial buffer");
-                }
-                Err(_) => return Err(Error::ChannelDisconnected),
-            }
-        };
+        let output = queue.pop().map_err(|_| Error::ChannelDisconnected)?;
         queue.push(output).map_err(|_| Error::ChannelDisconnected)?;
     }
     Ok(Iter {
@@ -88,7 +73,6 @@ fn run_encoder(
     resolution: (u32, u32),
     frame_rate: u32,
     bitrate: u32,
-    timeout: Duration,
 ) -> Result<(), Error> {
     info!("Spawned encoder thread");
 
@@ -107,43 +91,21 @@ fn run_encoder(
     }
     let mut frame_rate_limiter = FrameRateLimiter::new(frame_rate);
     for i in 0.. {
-        let output_buffer = acquire_output_buffer(&mut queue, i)?;
+        let output_buffer = queue.pop().map_err(|_| Error::ChannelDisconnected)?;
         frame_rate_limiter.step();
-        let frame = loop {
-            match duplication.acquire_next_frame(timeout.as_millis() as _) {
-                Ok(frame) => break frame,
-                Err(windows_capture::dxgi_duplication_api::Error::Timeout) => {
-                    // This can happen in a normal situation when the captured screen is static.
-                    debug!("Timed out while capturing frame {i}");
-                }
-                Err(err) => {
-                    error!("Failed to capture frame {i}: {err}");
-                    return Err(Error::DxgiDuplication(err));
-                }
-            }            
-        };
+        let frame = duplication.acquire_next_frame(u32::MAX)?;
         let downscaled_texture = downscaler.downscale(frame.texture())?;
-        encoder.encode(i, NVencBufferFormat::ARGB, downscaled_texture, &output_buffer)?;
+        encoder.encode(
+            i,
+            NVencBufferFormat::ARGB,
+            downscaled_texture,
+            &output_buffer,
+        )?;
         queue
             .push(output_buffer)
             .map_err(|_| Error::ChannelDisconnected)?;
     }
     Ok(())
-}
-
-fn acquire_output_buffer(queue: &mut SyncQueue<BitStream>, frame_index: usize) -> Result<BitStream, Error> {
-    loop {
-        match queue.pop() {
-            Ok(output) => return Ok(output),
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                debug!("Timed out waiting for empty buffer for frame {frame_index}");
-            }
-            Err(_) => {
-                warn!("Failed to pop empty buffer from queue");
-                return Err(Error::ChannelDisconnected);
-            }
-        }
-    }    
 }
 
 struct Iter {
@@ -155,14 +117,8 @@ impl Iterator for Iter {
     type Item = Result<(Vec<u8>, bool), Error>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let output = loop {
-            match self.queue.pop() {
-                Ok(output) => break output,
-                Err(mpsc::RecvTimeoutError::Timeout) => {
-                    debug!("Timed out waiting for full buffer");
-                }
-                Err(_) => return None,
-            }
+        let Ok(output) = self.queue.pop() else {
+            return None;
         };
         let before_lock = Instant::now();
         // try_lock(wait) should have wait=true, since we use the synchronous NVenc mode.
