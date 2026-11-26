@@ -4,102 +4,98 @@ use windows::{
     core::{PCSTR, Result},
 };
 
-pub type InputView = ID3D11ShaderResourceView;
-pub type OutputView = ID3D11UnorderedAccessView;
-
 pub struct Downscaler {
+    device: ID3D11Device,
     device_context: ID3D11DeviceContext,
     shader: ID3D11ComputeShader,
     sampler: ID3D11SamplerState,
+    output_texture: ID3D11Texture2D,
+    output_view: ID3D11UnorderedAccessView,
+    resolution: (u32, u32),
 }
 
 impl Downscaler {
-    pub fn new(device: &ID3D11Device, device_context: ID3D11DeviceContext) -> Result<Self> {
+    pub fn new(
+        device: ID3D11Device,
+        device_context: ID3D11DeviceContext,
+        format: DXGI_FORMAT,
+        resolution: (u32, u32),
+    ) -> Result<Self> {
+        let output_texture = create_output_texture(&device, format, resolution)?;
+        let output_view = create_unordered_access_view(&device, &output_texture)?;
         Ok(Self {
             device_context,
-            shader: create_shader(device)?,
-            sampler: create_sampler(device)?,
+            shader: create_shader(&device)?,
+            sampler: create_sampler(&device)?,
+            output_texture,
+            output_view,
+            resolution,
+            device,
         })
     }
 
     /// `target_resolution` must be equal to the size of `output_view`.
-    pub fn downscale(
-        &self,
-        input_view: InputView,
-        output_view: OutputView,
-        target_resolution: (u32, u32),
-    ) {
-        let (width, height) = target_resolution;
+    /// `input_texture` must have a `float4`-compatible format that
+    /// can be implicitly converted to the output format.
+    pub fn downscale(&self, input_texture: &ID3D11Texture2D) -> Result<&ID3D11Texture2D> {
+        let (width, height) = self.resolution;
         debug!("Downscaling texture to {width}x{height}");
 
         unsafe {
+            #[cfg(debug_assertions)]
+            check_input_texture(input_texture);
+            let input_view = create_shader_resource_view(&self.device, input_texture)?;
             let ctx = &self.device_context;
             ctx.CSSetShader(&self.shader, None);
             ctx.CSSetSamplers(0, Some(&[Some(self.sampler.clone())]));
             ctx.CSSetShaderResources(0, Some(&[Some(input_view)]));
-            ctx.CSSetUnorderedAccessViews(0, 1, Some(&Some(output_view)), None);
+            ctx.CSSetUnorderedAccessViews(0, 1, Some(&Some(self.output_view.clone())), None);
             ctx.Dispatch(width.div_ceil(8), height.div_ceil(8), 1);
         }
+        Ok(&self.output_texture)
     }
+}
 
-    /// Panics if `texture` is not a valid input texture.
-    /// Does not check if its format is `float4`-compatible.
-    pub fn check_input_texture(texture: &ID3D11Texture2D) {
-        unsafe {
-            let mut desc = D3D11_TEXTURE2D_DESC::default();
-            texture.GetDesc(&mut desc);
-            assert_eq!(desc.MipLevels, 1);
-            assert_eq!(desc.SampleDesc.Count, 1);
-            assert!(desc.BindFlags & D3D11_BIND_SHADER_RESOURCE.0 as u32 != 0);
-        }
+/// `format` must be HLSL `float4`-compatible (e.g. `RGBA8`, `BGRA8`).
+fn create_output_texture(
+    device: &ID3D11Device,
+    format: DXGI_FORMAT,
+    target_resolution: (u32, u32),
+) -> Result<ID3D11Texture2D> {
+    debug!("Creating resized texture");
+    let (target_width, target_height) = target_resolution;
+    unsafe {
+        let desc = D3D11_TEXTURE2D_DESC {
+            Width: target_width,
+            Height: target_height,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: format,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Usage: D3D11_USAGE_DEFAULT,
+            BindFlags: (D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS).0 as _,
+            CPUAccessFlags: 0,
+            MiscFlags: 0,
+        };
+        let mut texture = None;
+        device.CreateTexture2D(&desc, None, Some(&mut texture))?;
+        let texture = texture.unwrap();
+        Ok(texture)
     }
+}
 
-    /// `format` must be HLSL `float4`-compatible (e.g. `RGBA8`, `BGRA8`).
-    pub fn create_output_texture(
-        device: &ID3D11Device,
-        format: DXGI_FORMAT,
-        target_resolution: (u32, u32),
-    ) -> Result<ID3D11Texture2D> {
-        debug!("Creating resized texture");
-        let (target_width, target_height) = target_resolution;
-        unsafe {
-            let desc = D3D11_TEXTURE2D_DESC {
-                Width: target_width,
-                Height: target_height,
-                MipLevels: 1,
-                ArraySize: 1,
-                Format: format,
-                SampleDesc: DXGI_SAMPLE_DESC {
-                    Count: 1,
-                    Quality: 0,
-                },
-                Usage: D3D11_USAGE_DEFAULT,
-                BindFlags: (D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS).0 as _,
-                CPUAccessFlags: 0,
-                MiscFlags: 0,
-            };
-            let mut texture = None;
-            device.CreateTexture2D(&desc, None, Some(&mut texture))?;
-            let texture = texture.unwrap();
-            Ok(texture)
-        }
-    }
-
-    pub fn create_input_view(
-        device: &ID3D11Device,
-        input_texture: &ID3D11Texture2D,
-    ) -> Result<InputView> {
-        #[cfg(debug_assertions)]
-        Self::check_input_texture(input_texture);
-
-        create_shader_resource_view(device, input_texture)
-    }
-
-    pub fn create_output_view(
-        device: &ID3D11Device,
-        output_texture: &ID3D11Texture2D,
-    ) -> Result<OutputView> {
-        create_unordered_access_view(device, output_texture)
+/// Panics if `texture` is not a valid input texture.
+/// Does not check if its format is `float4`-compatible.
+fn check_input_texture(texture: &ID3D11Texture2D) {
+    unsafe {
+        let mut desc = D3D11_TEXTURE2D_DESC::default();
+        texture.GetDesc(&mut desc);
+        assert_eq!(desc.MipLevels, 1);
+        assert_eq!(desc.SampleDesc.Count, 1);
+        assert!(desc.BindFlags & D3D11_BIND_SHADER_RESOURCE.0 as u32 != 0);
     }
 }
 

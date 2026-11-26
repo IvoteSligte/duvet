@@ -3,7 +3,7 @@ use std::io::Write;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 const RESOLUTION: (u32, u32) = (1920, 1080);
-const FRAME_RATE: u32 = 60;
+const FRAME_RATE: u32 = 600;
 const BITRATE: u32 = 8 << 20; // 1 MB
 
 fn main() {

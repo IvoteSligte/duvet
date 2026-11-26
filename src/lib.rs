@@ -149,10 +149,12 @@ fn spawn_encoder_thread(
 
             let device = duplication.device();
             let encoder = create_encoder(device, resolution, frame_rate, bitrate)?;
-            let downscaler = Downscaler::new(device, duplication.device_context().clone())?;
-            let output_texture =
-                Downscaler::create_output_texture(device, DXGI_FORMAT_B8G8R8A8_UNORM, resolution)?;
-            let output_view = Downscaler::create_output_view(device, &output_texture)?;
+            let downscaler = Downscaler::new(
+                device.clone(),
+                duplication.device_context().clone(),
+                DXGI_FORMAT_B8G8R8A8_UNORM,
+                resolution,
+            )?;
             for _ in 0..NUM_BUFFERS {
                 queue
                     .push(encoder.create_bitstream_buffer()?)
@@ -161,7 +163,7 @@ fn spawn_encoder_thread(
             let mut frame_rate_limiter = FrameRateLimiter::new(frame_rate);
             let start_instant = Instant::now();
             for i in 0.. {
-                let output = loop {
+                let output_buffer = loop {
                     match queue.pop() {
                         Ok(output) => break output,
                         Err(mpsc::RecvTimeoutError::Timeout) => {
@@ -178,15 +180,18 @@ fn spawn_encoder_thread(
                     match duplication.acquire_next_frame(timeout.as_millis() as _) {
                         Ok(frame) => break frame,
                         Err(windows_capture::dxgi_duplication_api::Error::Timeout) => {
-                            warn!("Timed out while capturing frame {i}");
+                            // This can happen in a normal situation when the captured screen is static.
+                            debug!("Timed out while capturing frame {i}");
                         }
                         Err(err) => panic!("Failed to capture frame {i}: {err}"),
                     }
                 };
-                let input_view = Downscaler::create_input_view(frame.device(), frame.texture())?;
-                downscaler.downscale(input_view, output_view.clone(), resolution);
-                let registered =
-                    encoder.register_resource_dx11(&output_texture, NVencBufferFormat::ARGB, 0)?;
+                let downscaled_texture = downscaler.downscale(frame.texture())?;
+                let registered = encoder.register_resource_dx11(
+                    downscaled_texture,
+                    NVencBufferFormat::ARGB,
+                    0,
+                )?;
                 // TODO: provide an option for the user to manually insert IDRs instead of doing it automatically every second
                 let flags = match i % frame_rate as usize {
                     0 => NVencPicFlags::FORCE_IDR,
@@ -194,7 +199,7 @@ fn spawn_encoder_thread(
                 };
                 encoder.encode_picture(
                     &registered,
-                    &output,
+                    &output_buffer,
                     i,
                     start_instant.elapsed().as_millis() as u64,
                     NVencBufferFormat::ARGB,
@@ -203,7 +208,9 @@ fn spawn_encoder_thread(
                     flags,
                     None,
                 )?;
-                queue.push(output).map_err(|_| Error::ChannelDisconnected)?;
+                queue
+                    .push(output_buffer)
+                    .map_err(|_| Error::ChannelDisconnected)?;
             }
             Ok(())
         }
