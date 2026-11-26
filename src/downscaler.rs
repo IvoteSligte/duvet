@@ -89,6 +89,7 @@ fn create_output_texture(
 
 /// Panics if `texture` is not a valid input texture.
 /// Does not check if its format is `float4`-compatible.
+#[allow(unused)]
 fn check_input_texture(texture: &ID3D11Texture2D) {
     unsafe {
         let mut desc = D3D11_TEXTURE2D_DESC::default();
