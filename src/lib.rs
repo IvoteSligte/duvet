@@ -1,11 +1,11 @@
 use std::thread::JoinHandle;
 use std::time::Instant;
 
+use nvenc::bitstream::AsyncBitStream;
+use nvenc::sys::enums::{NVencBufferFormat, NVencPicType};
 use tracing::{debug, error, info, warn};
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 // TODO: rewrite windows_capture so it does not depend on rayon to reduce the number of (unused) dependencies
-use ::nvenc::bitstream::BitStream;
-use ::nvenc::sys::enums::{NVencBufferFormat, NVencPicType};
 use windows_capture::{dxgi_duplication_api::DxgiDuplicationApi, monitor::Monitor};
 
 use downscaler::Downscaler;
@@ -69,7 +69,7 @@ const NUM_BUFFERS: usize = 1;
 
 fn run_encoder(
     mut duplication: DxgiDuplicationApi,
-    mut queue: SyncQueue<BitStream>,
+    mut queue: SyncQueue<AsyncBitStream>,
     resolution: (u32, u32),
     frame_rate: u32,
     bitrate: u32,
@@ -110,7 +110,7 @@ fn run_encoder(
 
 struct Iter {
     handle: Option<JoinHandle<Result<(), Error>>>,
-    queue: SyncQueue<BitStream>,
+    queue: SyncQueue<AsyncBitStream>,
 }
 
 impl Iterator for Iter {
@@ -121,8 +121,7 @@ impl Iterator for Iter {
             return None;
         };
         let before_lock = Instant::now();
-        // try_lock(wait) should have wait=true, since we use the synchronous NVenc mode.
-        let result = match output.try_lock(true) {
+        let result = match output.try_lock() {
             Ok(lock) => {
                 let picture_type = lock.picture_type();
                 if picture_type == NVencPicType::UNKNOWN {

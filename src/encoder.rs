@@ -1,5 +1,5 @@
 use ::nvenc::{
-    bitstream::BitStream,
+    bitstream::AsyncBitStream,
     encoder::Encoder as NVencEncoder,
     session::{InitParams, NeedsConfig, Session},
     sys::{
@@ -58,6 +58,7 @@ impl Encoder {
             frame_rate: [frame_rate, 1],
             resolution: [width, height],
             enable_ptd: true,
+            enable_async: true,
             max_encoder_resolution: [0, 0],
         };
         Ok(Self {
@@ -67,8 +68,8 @@ impl Encoder {
         })
     }
 
-    pub fn create_output_buffer(&self) -> Result<BitStream, Error> {
-        Ok(self.inner.create_bitstream_buffer()?)
+    pub fn create_output_buffer(&self) -> Result<AsyncBitStream, Error> {
+        Ok(self.inner.create_async_bitstream_buffer()?)
     }
 
     pub fn encode(
@@ -76,7 +77,7 @@ impl Encoder {
         frame_index: usize,
         input_format: NVencBufferFormat,
         input_texture: &ID3D11Texture2D,
-        output_buffer: &BitStream,
+        output_buffer: &AsyncBitStream,
     ) -> Result<(), Error> {
         // TODO: register all the possible input textures in advance
         let registered =
